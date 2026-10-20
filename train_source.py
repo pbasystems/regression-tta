@@ -22,6 +22,7 @@ from evaluation.evaluator import RegressionEvaluator
 from handlers import EvaluationAccumulator, EvaluationRunner
 from model import Regressor, create_regressor
 from trainer import RegressionTrainer
+from utils.early_stopping import attach_early_stopping
 from utils.reporter import create_reporter_from_config, get_domain_tag
 from utils.seed import fix_seed
 
@@ -78,7 +79,10 @@ def main(args):
         evaluator, val_dl, "val_" + config["dataset"]["name"], val_ev_logger
     )
 
-    trainer = RegressionTrainer(net, opt, **config["trainer"])
+    trainer_cfg = copy.deepcopy(config["trainer"])
+    es_cfg = config.get("early_stopping", trainer_cfg.pop("early_stopping", None))
+
+    trainer = RegressionTrainer(net, opt, **trainer_cfg)
 
     if "scheduler" in config["optimizer"]:
         scheduler = create_scheduler(opt, config, len(train_dl))
@@ -106,6 +110,19 @@ def main(args):
         reporter.log_metrics(log_dict, step=epoch)
 
     trainer.add_event_handler(Events.EPOCH_COMPLETED, _log_epoch_to_reporter)
+
+    # Attach early stopping (restores best weights before ModelCheckpoint saves)
+    if es_cfg is None or es_cfg.get("enabled", True):
+        patience = (es_cfg or {}).get("patience", 20)
+        min_delta = (es_cfg or {}).get("min_delta", 1e-4)
+        attach_early_stopping(
+            trainer=trainer,
+            evaluator=evaluator,
+            model=net,
+            patience=patience,
+            min_delta=min_delta,
+            reporter=reporter,
+        )
 
     trainer.add_event_handler(
         Events.COMPLETED,

@@ -12,6 +12,7 @@ import pandas as pd
 import torch
 import yaml
 from dotenv import load_dotenv
+from ignite.engine import Events
 from torch.utils.data import DataLoader
 
 from adaptation import create_optimizer as create_tta_optimizer
@@ -22,6 +23,7 @@ from model import create_regressor
 from trainer import RegressionTrainer
 from tta import TTAEngine
 from tune_optuna import run_tta_trial
+from utils.early_stopping import attach_early_stopping
 from utils.reporter import Reporter
 from utils.seed import fix_seed
 
@@ -107,8 +109,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--epochs",
         type=int,
-        default=50,
-        help="Number of training epochs for base and source-tuned models (default: 50)",
+        default=200,
+        help="Maximum training epochs for base and source-tuned models (default: 200, with EarlyStopping)",
+    )
+    parser.add_argument(
+        "--patience",
+        type=int,
+        default=20,
+        help="EarlyStopping patience on source validation RMSE (default: 20, matching DA-Replications)",
     )
     parser.add_argument(
         "--fds",
@@ -145,10 +153,16 @@ def parse_args() -> argparse.Namespace:
 def build_base_train_config(
     fd: str,
     epochs: int,
+    patience: int = 20,
     arch_cfg: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
         "epoch": epochs,
+        "early_stopping": {
+            "enabled": True,
+            "patience": patience,
+            "min_delta": 1.0e-4,
+        },
         "dataset": {
             "name": "cmapss",
             "config": {
@@ -280,17 +294,18 @@ def train_or_load_domain_model(
     fd: str,
     out_root: Path,
     epochs: int,
+    patience: int,
     seed: int,
     use_wandb: bool,
     wandb_project: str,
 ) -> tuple[Path, Path, dict[str, Any], dict[str, Any]]:
-    """Trains (or loads if already cached) the base model and feature_stats.pt for a single FD domain."""
+    """Trains (or loads if cached) the base model with EarlyStopping and feature_stats.pt for a single FD domain."""
     domain_dir = out_root / "domain_models" / fd
     domain_dir.mkdir(parents=True, exist_ok=True)
     ckpt_path = domain_dir / f"source_model_{fd}.pt"
     stat_path = domain_dir / "feature_stats.pt"
     meta_path = domain_dir / "train_summary.json"
-    train_cfg = build_base_train_config(fd, epochs=epochs)
+    train_cfg = build_base_train_config(fd, epochs=epochs, patience=patience)
 
     if ckpt_path.is_file() and stat_path.is_file() and meta_path.is_file():
         print(f"[{fd}] Loading existing base model from {ckpt_path}")
@@ -298,9 +313,8 @@ def train_or_load_domain_model(
             meta = json.load(f)
         return ckpt_path, stat_path, train_cfg, meta
 
-    print(f"\n================ TRAINING BASE MODEL ON {fd} ({epochs} epochs) ================")
     print(
-        f"\n================ TRAINING BASE MODEL ON {fd} ({epochs} epochs) ================"
+        f"\n================ TRAINING BASE MODEL ON {fd} (max {epochs} epochs, patience={patience}) ================"
     )
     fix_seed(seed)
     reporter = Reporter(
@@ -320,9 +334,34 @@ def train_or_load_domain_model(
     val_dl = DataLoader(val_ds, **train_cfg["val_dataloader"])
 
     trainer = RegressionTrainer(net, opt, **train_cfg["trainer"])
+    val_ev = RegressionEvaluator(net, **train_cfg["evaluator"])
+
+    @trainer.on(Events.EPOCH_COMPLETED)
+    def _eval_and_log(engine: Any) -> None:
+        val_ev.run(val_dl)
+        ep = engine.state.epoch
+        reporter.log_metrics(
+            {
+                "epoch": ep,
+                "train/rmse": float(trainer.state.metrics["rmse"]),
+                "train/mae": float(trainer.state.metrics["mae"]),
+                "val/rmse_loss": float(val_ev.state.metrics["rmse_loss"]),
+                "val/mae_loss": float(val_ev.state.metrics["mae_loss"]),
+                "val/R2": float(val_ev.state.metrics["R2"]),
+            },
+            step=ep,
+        )
+
+    stopper = attach_early_stopping(
+        trainer=trainer,
+        evaluator=val_ev,
+        model=net,
+        patience=patience,
+        reporter=reporter,
+    )
     trainer.run(train_dl, max_epochs=epochs)
 
-    val_ev = RegressionEvaluator(net, **train_cfg["evaluator"])
+    # Re-evaluate restored best weights on validation split
     val_ev.run(val_dl)
 
     torch.save(net.state_dict(), ckpt_path)
@@ -330,7 +369,9 @@ def train_or_load_domain_model(
 
     meta = {
         "fd": fd,
-        "epochs": epochs,
+        "max_epochs": epochs,
+        "best_epoch": stopper.best_epoch,
+        "patience": patience,
         "cov_rank": cov_rank,
         "train_metrics": {k: float(v) for k, v in trainer.state.metrics.items()},
         "val_metrics": {k: float(v) for k, v in val_ev.state.metrics.items()},
@@ -340,9 +381,10 @@ def train_or_load_domain_model(
 
     reporter.log_metrics(
         {
-            "val/rmse_loss": meta["val_metrics"]["rmse_loss"],
-            "val/mae_loss": meta["val_metrics"]["mae_loss"],
-            "val/R2": meta["val_metrics"]["R2"],
+            "best_epoch": stopper.best_epoch,
+            "best_val/rmse_loss": meta["val_metrics"]["rmse_loss"],
+            "best_val/mae_loss": meta["val_metrics"]["mae_loss"],
+            "best_val/R2": meta["val_metrics"]["R2"],
             "cov_rank": cov_rank,
         }
     )
@@ -362,11 +404,12 @@ def tune_source_domain_optuna(
     storage: str,
     n_trials: int,
     epochs: int,
+    patience: int,
     seed: int,
     use_wandb: bool,
     wandb_project: str,
 ) -> tuple[Path, Path, dict[str, Any], dict[str, Any]]:
-    """Tunes source model architecture & optimizer on FD validation split (source_val_rmse objective)."""
+    """Tunes source model architecture & optimizer on FD validation split with EarlyStopping."""
     tuned_dir = out_root / "source_tuned_models" / fd
     tuned_dir.mkdir(parents=True, exist_ok=True)
     ckpt_path = tuned_dir / f"best_source_model_{fd}.pt"
@@ -374,6 +417,7 @@ def tune_source_domain_optuna(
     cfg_path = tuned_dir / "best_train_config.yaml"
     summary_path = tuned_dir / "source_optuna_summary.json"
 
+    if ckpt_path.is_file() and stat_path.is_file() and cfg_path.is_file() and summary_path.is_file():
     if (
         ckpt_path.is_file()
         and stat_path.is_file()
@@ -388,16 +432,21 @@ def tune_source_domain_optuna(
         return ckpt_path, stat_path, best_train_cfg, summary
 
     print(
-        f"\n================ OPTUNA SOURCE TUNING ON {fd} ({n_trials} trials) ================"
+        f"\n================ OPTUNA SOURCE TUNING ON {fd} ({n_trials} trials, patience={patience}) ================"
     )
     study_name = f"benchmark_source_val_rmse_{fd}"
-    base_train_cfg = build_base_train_config(fd, epochs=epochs)
+    base_train_cfg = build_base_train_config(fd, epochs=epochs, patience=patience)
 
     reporter = Reporter(
         name=f"Benchmark.SourceOptuna.{fd}",
         use_wandb=use_wandb,
         wandb_project=wandb_project,
-        wandb_config={"fd": fd, "n_trials": n_trials, "epochs": epochs},
+        wandb_config={
+            "fd": fd,
+            "n_trials": n_trials,
+            "epochs": epochs,
+            "patience": patience,
+        },
         wandb_run_name=f"{fd} | Optuna [source_val_rmse] ({n_trials} trials)",
     )
 
@@ -406,6 +455,7 @@ def tune_source_domain_optuna(
         "config": None,
         "state_dict": None,
         "val_metrics": None,
+        "best_epoch": 0,
     }
 
     def objective(trial: optuna.Trial) -> float:
@@ -453,13 +503,25 @@ def tune_source_domain_optuna(
         val_dl = DataLoader(val_ds, **cfg["val_dataloader"])
 
         trainer = RegressionTrainer(net, opt, **cfg["trainer"])
+        val_ev = RegressionEvaluator(net, **cfg["evaluator"])
+
+        @trainer.on(Events.EPOCH_COMPLETED)
+        def _run_val(_: Any) -> None:
+            val_ev.run(val_dl)
+
+        stopper = attach_early_stopping(
+            trainer=trainer,
+            evaluator=val_ev,
+            model=net,
+            patience=patience,
+        )
         trainer.run(train_dl, max_epochs=cfg["epoch"])
 
-        val_ev = RegressionEvaluator(net, **cfg["evaluator"])
         val_ev.run(val_dl)
         val_metrics = {k: float(v) for k, v in val_ev.state.metrics.items()}
         val_rmse = val_metrics["rmse_loss"]
 
+        trial.set_user_attr("best_epoch", stopper.best_epoch)
         trial.set_user_attr("val_rmse", val_rmse)
         trial.set_user_attr("val_mae", val_metrics["mae_loss"])
         trial.set_user_attr("val_R2", val_metrics["R2"])
@@ -467,6 +529,7 @@ def tune_source_domain_optuna(
         reporter.log_metrics(
             {
                 "trial": trial.number,
+                "trial/best_epoch": stopper.best_epoch,
                 "trial/source_val_rmse": val_rmse,
                 "trial/source_val_mae": val_metrics["mae_loss"],
                 "trial/source_val_R2": val_metrics["R2"],
@@ -479,6 +542,7 @@ def tune_source_domain_optuna(
             best_holder["config"] = cfg
             best_holder["state_dict"] = copy.deepcopy(net.state_dict())
             best_holder["val_metrics"] = val_metrics
+            best_holder["best_epoch"] = stopper.best_epoch
 
         return val_rmse
 
@@ -512,6 +576,7 @@ def tune_source_domain_optuna(
         "fd": fd,
         "study_name": study_name,
         "best_trial": study.best_trial.number,
+        "best_epoch": best_holder["best_epoch"],
         "best_source_val_rmse": float(study.best_value),
         "best_params": study.best_params,
         "val_metrics": best_holder["val_metrics"],
@@ -772,6 +837,7 @@ def main() -> None:
             fd=fd,
             out_root=out_root,
             epochs=args.epochs,
+            patience=args.patience,
             seed=args.seed,
             use_wandb=use_wandb,
             wandb_project=args.wandb_project,
@@ -783,6 +849,7 @@ def main() -> None:
                 storage=args.storage,
                 n_trials=args.n_source_trials,
                 epochs=args.epochs,
+                patience=args.patience,
                 seed=args.seed,
                 use_wandb=use_wandb,
                 wandb_project=args.wandb_project,

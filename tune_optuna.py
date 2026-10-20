@@ -11,6 +11,7 @@ import optuna
 import torch
 import yaml
 from dotenv import load_dotenv
+from ignite.engine import Events
 from torch.utils.data import DataLoader
 
 from adaptation import create_optimizer as create_tta_optimizer
@@ -20,6 +21,7 @@ from feature_stats import resolve_checkpoint_path
 from model import create_regressor
 from trainer import RegressionTrainer
 from tta import TTAEngine
+from utils.early_stopping import attach_early_stopping
 from utils.loss import diagonal_gaussian_kl_loss
 from utils.pca_basis import get_pca_basis
 from utils.reporter import Reporter, get_domain_tag
@@ -83,6 +85,12 @@ def parse_args() -> argparse.Namespace:
         default=15,
         help="Number of Optuna trials to run",
     )
+    parser.add_argument(
+        "--patience",
+        type=int,
+        default=20,
+        help="Early stopping patience for source training (default: 20)",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--no-wandb",
@@ -136,9 +144,10 @@ def run_source_val_trial(
     base_tta_cfg: dict[str, Any],
     out_dir: Path,
     seed: int,
+    patience: int = 20,
     reporter: Reporter | None = None,
 ) -> tuple[float, dict[str, Any], dict[str, Any], torch.nn.Module]:
-    """Tunes source model using ONLY Source Validation RMSE (strictly zero target domain leakage)."""
+    """Tunes source model using ONLY Source Validation RMSE with EarlyStopping (zero target domain leakage)."""
     fix_seed(seed)
     train_cfg = copy.deepcopy(base_train_cfg)
     tta_cfg = copy.deepcopy(base_tta_cfg)
@@ -180,10 +189,22 @@ def run_source_val_trial(
     val_dl = DataLoader(val_ds, **train_cfg["val_dataloader"])
 
     trainer = RegressionTrainer(net, source_opt, **train_cfg["trainer"])
+    val_ev = RegressionEvaluator(net, **train_cfg["evaluator"])
+
+    @trainer.on(Events.EPOCH_COMPLETED)
+    def _run_val(_: Any) -> None:
+        val_ev.run(val_dl)
+
+    stopper = attach_early_stopping(
+        trainer=trainer,
+        evaluator=val_ev,
+        model=net,
+        patience=patience,
+        reporter=reporter,
+    )
     trainer.run(train_dl, max_epochs=train_cfg["epoch"])
 
-    # Evaluate on Source Validation split (the ONLY optimization objective here)
-    val_ev = RegressionEvaluator(net, **train_cfg["evaluator"])
+    # Evaluate restored best weights on Source Validation split
     val_ev.run(val_dl)
     source_val_metrics = dict(val_ev.state.metrics)
     source_val_rmse = float(source_val_metrics["rmse_loss"])
@@ -196,11 +217,13 @@ def run_source_val_trial(
     target_unadapted_metrics = dict(target_ev.state.metrics)
 
     metrics = {
+        "best_epoch": stopper.best_epoch,
         "source_train": dict(trainer.state.metrics),
         "source_val": source_val_metrics,
         "target_unadapted": target_unadapted_metrics,
     }
 
+    trial.set_user_attr("best_epoch", stopper.best_epoch)
     trial.set_user_attr("source_val_rmse", source_val_rmse)
     trial.set_user_attr("source_val_mae", float(source_val_metrics["mae_loss"]))
     trial.set_user_attr("source_val_R2", float(source_val_metrics["R2"]))
@@ -215,6 +238,7 @@ def run_source_val_trial(
         reporter.log_metrics(
             {
                 "trial": trial.number,
+                "trial/best_epoch": stopper.best_epoch,
                 "trial/source_val_rmse": source_val_rmse,
                 "trial/source_val_mae": float(source_val_metrics["mae_loss"]),
                 "trial/source_val_R2": float(source_val_metrics["R2"]),
@@ -374,6 +398,7 @@ def main() -> None:
         wandb_config={
             "objective": args.objective,
             "n_trials": args.n_trials,
+            "patience": args.patience,
             "storage": args.storage,
             "study_name": study_name,
             "base_tta_config": base_tta_config,
@@ -397,6 +422,7 @@ def main() -> None:
                 base_tta_cfg=base_tta_config,
                 out_dir=out_dir,
                 seed=args.seed,
+                patience=args.patience,
                 reporter=reporter,
             )
             if score < best_state["score"]:

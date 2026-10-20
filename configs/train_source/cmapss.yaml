@@ -1,4 +1,9 @@
-epoch: 30
+epoch: 200
+
+early_stopping:
+  enabled: true
+  patience: 20
+  min_delta: 1.0e-4
 
 wandb:
   use_wandb: true
