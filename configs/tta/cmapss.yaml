@@ -2,22 +2,30 @@ dataset:
   name: cmapss
   config:
     source_domain: false
-    standardize: true
+    norm_mode: minmax
+    combine_splits_for_stats: true
     source_fd: FD001
-    target_fd: FD003
+    target_fd: FD002
     source_split: train
-    target_split: train
+    target_split: test
+    feature_cols: all_24
     max_rul: 125.0
     normalize_rul: false
-    window_size: 1
+    window_size: 30
+    last_window_only: false
 
 regressor:
-  source: result/source/cmapss/source_model_14550.pt
-  type: table
+  source: result/source/cmapss_fd001_fd002
+  type: lstm_dann
   config:
-    in_dims: 14
-    h_dims: 100
-    n_rep: 4
+    input_size: 24
+    lstm_hidden_size: 128
+    f_size: 64
+    num_layers: 1
+    lstm_dropout: 0.5
+    regressor_dropout: 0.3
+    regressor_first_hidden_size: 32
+    regressor_second_hidden_size: 0
 
 optimizer:
   param: fe
@@ -33,7 +41,7 @@ tta:
     weight_bias: 1.0
     weight_exp: 1.0
     pc_config:
-      stat_file: result/source/cmapss/feature_stats.pt
+      stat_file: result/source/cmapss_fd001_fd002/feature_stats.pt
       contrib_top_k: 5
     loss_config:
       eps: 1.0e-8
@@ -43,7 +51,7 @@ evaluator:
   compile_model: *compile_model
 
 adapt_dataloader:
-  batch_size: 64
+  batch_size: 256
   shuffle: true
 
 val_dataloader:

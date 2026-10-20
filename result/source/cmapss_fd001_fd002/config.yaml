@@ -1,0 +1,43 @@
+dataset:
+  config:
+    combine_splits_for_stats: true
+    feature_cols: all_24
+    max_rul: 125.0
+    norm_mode: minmax
+    normalize_rul: false
+    source_domain: true
+    source_fd: FD001
+    source_split: train
+    target_fd: FD002
+    target_split: train
+    window_size: 30
+  name: cmapss
+  split_by_engine: true
+  train_ratio: 0.9
+epoch: 30
+evaluator:
+  compile_model: null
+optimizer:
+  config:
+    lr: 0.001
+    weight_decay: 0.0001
+  name: Adam
+  param: all
+regressor:
+  config:
+    f_size: 64
+    input_size: 24
+    lstm_dropout: 0.5
+    lstm_hidden_size: 128
+    num_layers: 1
+    regressor_dropout: 0.3
+    regressor_first_hidden_size: 32
+    regressor_second_hidden_size: 0
+  type: lstm_dann
+train_dataloader:
+  batch_size: 256
+  shuffle: true
+trainer:
+  compile_model: null
+val_dataloader:
+  batch_size: 256

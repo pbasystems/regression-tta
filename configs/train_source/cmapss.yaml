@@ -1,32 +1,40 @@
-epoch: 50
+epoch: 30
 
 dataset:
   name: cmapss
   config:
     source_domain: true
-    standardize: true
+    norm_mode: minmax
+    combine_splits_for_stats: true
     source_fd: FD001
-    target_fd: FD003
+    target_fd: FD002
     source_split: train
     target_split: train
+    feature_cols: all_24
     max_rul: 125.0
     normalize_rul: false
-    window_size: 1
+    window_size: 30
   train_ratio: 0.9
+  split_by_engine: true
 
 regressor:
-  type: table
+  type: lstm_dann
   config:
-    in_dims: 14
-    h_dims: 100
-    n_rep: 4
+    input_size: 24
+    lstm_hidden_size: 128
+    f_size: 64
+    num_layers: 1
+    lstm_dropout: 0.5
+    regressor_dropout: 0.3
+    regressor_first_hidden_size: 32
+    regressor_second_hidden_size: 0
 
 optimizer:
   param: all
   name: Adam
   config:
     lr: 1.0e-3
-    weight_decay: 5.0e-4
+    weight_decay: 1.0e-4
 
 trainer:
   compile_model: &compile_model null
@@ -35,7 +43,7 @@ evaluator:
   compile_model: *compile_model
 
 train_dataloader:
-  batch_size: 64
+  batch_size: 256
   shuffle: true
 
 val_dataloader:
