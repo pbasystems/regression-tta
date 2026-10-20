@@ -1,0 +1,17 @@
+# Install with:
+#   pip install -r requirements.txt
+# PyTorch CUDA 12.6 wheels are fetched from the PyTorch index (same as docker/Dockerfile).
+--extra-index-url https://download.pytorch.org/whl/cu126
+
+numpy<2
+pandas
+scipy
+pyyaml
+scikit-image
+torch
+torchvision
+torchaudio
+pytorch-ignite
+timm
+imagenet-c
+pillow

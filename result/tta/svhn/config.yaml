@@ -1,0 +1,33 @@
+adapt_dataloader:
+  batch_size: 64
+  shuffle: true
+dataset:
+  name: mnist
+evaluator:
+  compile_model: null
+optimizer:
+  config:
+    lr: 0.001
+    weight_decay: 0.0
+  name: Adam
+  param: fe_bn
+regressor:
+  config:
+    backbone: resnet26
+    in_channels: 3
+    pretrained: false
+  source: result/source/svhn/source_model_114500.pt
+  type: image
+tta:
+  config:
+    compile_model: null
+    loss_config:
+      eps: 1.0e-08
+    pc_config:
+      contrib_top_k: 100
+      stat_file: result/source/svhn/feature_stats.pt
+    train_mode: true
+    weight_bias: 1.0
+    weight_exp: 1.0
+val_dataloader:
+  batch_size: 256

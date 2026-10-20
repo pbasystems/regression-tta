@@ -1,0 +1,31 @@
+[project]
+name = "regression-tta"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Yasantha Niroshan", email = "niroshanyi@gmail.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "imagenet-c>=0.0.3",
+    "numpy<2",
+    "pandas>=2.3.3",
+    "pillow>=12.3.0",
+    "pytorch-ignite>=0.5.5",
+    "pyyaml>=6.0.3",
+    "scikit-image>=0.26.0",
+    "scipy>=1.17.1",
+    "setuptools<81",
+    "timm>=1.0.30",
+    "torch>=2.14.1",
+    "torchaudio>=2.11.0",
+    "torchvision>=0.29.1",
+]
+
+[project.scripts]
+regression-tta = "regression_tta:main"
+
+[build-system]
+requires = ["uv_build>=0.12.1,<0.13.0"]
+build-backend = "uv_build"

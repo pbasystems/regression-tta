@@ -1,5 +1,5 @@
-SVHN_PATH = "/path/to/svhn"
-MNIST_PATH = "/path/to/mnist"
+SVHN_PATH = "/home/intellisense01/Predictive-Maintenance/Datasets/SVHN"
+MNIST_PATH = "/home/intellisense01/Predictive-Maintenance/Datasets/MNIST"
 UTKFACE_PATH = "/path/to/utkface"
 BIWI_PATH = "/path/to/BiwiKinect"
 CALIFORNIA_HOUSING_PATH = "/path/to/california_housing"
