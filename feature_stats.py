@@ -1,26 +1,39 @@
-from dataclasses import dataclass, InitVar
-from pprint import pprint
 import json
+from dataclasses import InitVar, dataclass
 from pathlib import Path
-
-import torch
-from torch import Tensor
-from torch.utils.data import DataLoader
-from ignite.engine import Engine
+from pprint import pprint
 
 import numpy as np
+import torch
 import yaml
+from ignite.engine import Engine
+from torch import Tensor
+from torch.utils.data import DataLoader
 
 from dataset import get_datasets
-from model import create_regressor, Regressor
+from model import Regressor, create_regressor
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def resolve_checkpoint_path(source_path: str) -> Path:
+    p = Path(source_path)
+    if p.is_file():
+        return p
+    search_dir = p if p.is_dir() else p.parent
+    candidates = sorted(
+        search_dir.glob("source_model_*.pt"), key=lambda x: x.stat().st_mtime
+    )
+    if candidates:
+        return candidates[-1]
+    return p
 
 
 def parse_args():
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("-c", required=True,
-                        help="config file")
+    parser.add_argument("-c", required=True, help="config file")
     parser.add_argument("-o", required=True, help="output directory")
     parser.add_argument("--save_feature", action="store_true")
     parser.add_argument("--validation", action="store_true")
@@ -44,12 +57,12 @@ def main(args):
     ds = get_datasets(config)[1 if args.validation else 0]
     dl = DataLoader(ds, **config["dataloader"])
 
-    regressor = create_regressor(config).cuda()
-    regressor.load_state_dict(torch.load(p := config["regressor"]["source"]))
-    print(f"load regressor: {p}")
+    regressor = create_regressor(config).to(DEVICE)
+    ckpt_path = resolve_checkpoint_path(config["regressor"]["source"])
+    regressor.load_state_dict(torch.load(ckpt_path, map_location=DEVICE))
+    print(f"load regressor: {ckpt_path}")
 
-    calc = FeatureStatCalculator(
-        regressor, **config["calculator"])
+    calc = FeatureStatCalculator(regressor, **config["calculator"])
     print("run calculator", flush=True)
     calc.run(dl)
 
@@ -60,11 +73,14 @@ def main(args):
     print(f"rank of cov: {np.linalg.matrix_rank(cov_np)}")
 
     p = Path(args.o, "feature_stats.pt")
-    torch.save({
-        "mean": mean,
-        "basis": torch.from_numpy(eigvecs),
-        "eigvals": torch.from_numpy(eigvals)
-    }, str(p))
+    torch.save(
+        {
+            "mean": mean,
+            "basis": torch.from_numpy(eigvecs),
+            "eigvals": torch.from_numpy(eigvals),
+        },
+        str(p),
+    )
 
     if args.save_feature:
         p = Path(args.o, "raw_features.pt")
@@ -85,7 +101,8 @@ class FeatureStatCalculator(Engine):
         else:
             try:
                 self.regressor_feature = torch.compile(
-                    self.regressor.feature, **compile_model)
+                    self.regressor.feature, **compile_model
+                )
             except RuntimeError as e:
                 print(f"torch.compile failed: {e}")
                 self.regressor_feature = self.regressor.feature
@@ -100,9 +117,9 @@ class FeatureStatCalculator(Engine):
         self.regressor.eval()
 
         x, _ = batch
-        x = x.cuda()
+        x = x.to(DEVICE)
 
-        feat = self.regressor_feature(x)    # (B,D)
+        feat = self.regressor_feature(x)  # (B,D)
         self._features.append(feat.cpu())
 
     def compute_stats(self, ddof: int = 1) -> tuple[Tensor, Tensor, Tensor]:
@@ -110,7 +127,7 @@ class FeatureStatCalculator(Engine):
 
         features = torch.cat(self._features)
         mean = features.mean(dim=0)
-        features_c = features - mean    # (B,D)
+        features_c = features - mean  # (B,D)
         cov = features_c.T @ features_c / (features.shape[0] - ddof)
 
         return mean, cov, features

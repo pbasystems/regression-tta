@@ -1,30 +1,34 @@
-from typing import Any
+import copy
 import json
+import sys
 from pathlib import Path
 from pprint import pprint
-import copy
-import sys
-
-import yaml
+from typing import Any
 
 import torch
+import yaml
+from ignite.engine.events import Events
+from ignite.handlers.checkpoint import ModelCheckpoint
+from ignite.handlers.param_scheduler import (
+    CosineAnnealingScheduler,
+    create_lr_scheduler_with_warmup,
+)
 from torch.optim import Optimizer
 from torch.utils.data import DataLoader
-from ignite.engine.events import Events
-from ignite.handlers.param_scheduler import (CosineAnnealingScheduler,
-                                             create_lr_scheduler_with_warmup)
-from ignite.handlers.checkpoint import ModelCheckpoint
 
 from dataset import get_datasets
-from model import create_regressor, Regressor
-from trainer import RegressionTrainer
 from evaluation.evaluator import RegressionEvaluator
 from handlers import EvaluationAccumulator, EvaluationRunner
+from model import Regressor, create_regressor
+from trainer import RegressionTrainer
 from utils.seed import fix_seed
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 def parse_args():
     import argparse
+
     parser = argparse.ArgumentParser()
     parser.add_argument("-c", required=True, help="config")
     parser.add_argument("-o", required=True, help="output directory")
@@ -49,7 +53,7 @@ def main(args):
 
     fix_seed(args.seed)
 
-    net = create_regressor(config).cuda()
+    net = create_regressor(config).to(DEVICE)
 
     opt = create_optimizer(net, config)
 
@@ -61,7 +65,8 @@ def main(args):
 
     val_ev_logger = EvaluationAccumulator()
     val_ev_runner = EvaluationRunner(
-        evaluator, val_dl, "val_" + config["dataset"]["name"], val_ev_logger)
+        evaluator, val_dl, "val_" + config["dataset"]["name"], val_ev_logger
+    )
 
     trainer = RegressionTrainer(net, opt, **config["trainer"])
 
@@ -71,27 +76,40 @@ def main(args):
 
     train_ev_logger = EvaluationAccumulator()
     train_ev_runner = EvaluationRunner(
-        trainer, train_dl, "train_" + config["dataset"]["name"], train_ev_logger, run_evaluator=False)
+        trainer,
+        train_dl,
+        "train_" + config["dataset"]["name"],
+        train_ev_logger,
+        run_evaluator=False,
+    )
     trainer.add_event_handler(Events.EPOCH_COMPLETED, train_ev_runner)
 
     trainer.add_event_handler(Events.EPOCH_COMPLETED, val_ev_runner)
-    trainer.add_event_handler(Events.COMPLETED,
-                              ModelCheckpoint(args.o, "source",
-                                              require_empty=False),
-                              {"model": net})
+    trainer.add_event_handler(
+        Events.COMPLETED,
+        ModelCheckpoint(args.o, "source", require_empty=False),
+        {"model": net},
+    )
 
     p = Path(args.o)
-    trainer.add_event_handler(Events.COMPLETED,
-                              lambda _: val_ev_logger.get_dataframe().to_csv(str(p / "val_metrics.csv"), index=False))
-    trainer.add_event_handler(Events.COMPLETED,
-                              lambda _: train_ev_logger.get_dataframe().to_csv(str(p / "train_metrics.csv"), index=False))
+    trainer.add_event_handler(
+        Events.COMPLETED,
+        lambda _: val_ev_logger.get_dataframe().to_csv(
+            str(p / "val_metrics.csv"), index=False
+        ),
+    )
+    trainer.add_event_handler(
+        Events.COMPLETED,
+        lambda _: train_ev_logger.get_dataframe().to_csv(
+            str(p / "train_metrics.csv"), index=False
+        ),
+    )
     trainer.run(train_dl, max_epochs=config["epoch"])
 
     print("done")
 
 
-def create_optimizer(net: Regressor,
-                     config: dict[str, Any]) -> Optimizer:
+def create_optimizer(net: Regressor, config: dict[str, Any]) -> Optimizer:
     match p := config["optimizer"]["param"]:
         case "all":
             param = net.parameters()
@@ -100,7 +118,8 @@ def create_optimizer(net: Regressor,
 
     print("param:", p)
     opt = eval(f"torch.optim.{config['optimizer']['name']}")(
-        param, **config["optimizer"]["config"])
+        param, **config["optimizer"]["config"]
+    )
     return opt
 
 
@@ -109,19 +128,23 @@ def create_scheduler(opt: Optimizer, config: dict[str, Any], iter_per_epoch: int
 
     match scheduler_config["type"]:
         case "cos":
-            scheduler_config["config"]["cos"]["cycle_size"] = config["epoch"] * iter_per_epoch
+            scheduler_config["config"]["cos"]["cycle_size"] = (
+                config["epoch"] * iter_per_epoch
+            )
             scheduler = CosineAnnealingScheduler(
-                opt, **scheduler_config["config"]["cos"])
+                opt, **scheduler_config["config"]["cos"]
+            )
         case "warmup_cos":
             wd = scheduler_config["config"]["warmup"]["warmup_duration"]
             scheduler_config["config"]["cos"]["cycle_size"] = (
-                config["epoch"] - wd + 1) * iter_per_epoch
-            cos_sc = CosineAnnealingScheduler(
-                opt, **scheduler_config["config"]["cos"])
+                config["epoch"] - wd + 1
+            ) * iter_per_epoch
+            cos_sc = CosineAnnealingScheduler(opt, **scheduler_config["config"]["cos"])
 
             scheduler_config["config"]["warmup"]["warmup_duration"] *= iter_per_epoch
             scheduler = create_lr_scheduler_with_warmup(
-                cos_sc, **scheduler_config["config"]["warmup"])
+                cos_sc, **scheduler_config["config"]["warmup"]
+            )
 
         case _:
             raise ValueError(f"Invalid scheduler type: {scheduler_config!r}")

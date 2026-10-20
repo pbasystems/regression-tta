@@ -1,14 +1,16 @@
-from dataclasses import dataclass, InitVar
+from dataclasses import InitVar, dataclass
 
 import torch
-from torch import Tensor
 import torch.nn.functional as F
-from ignite.engine import Engine
-from ignite.metrics import RootMeanSquaredError, MeanAbsoluteError
 from ignite.contrib.metrics.regression.r2_score import R2Score
+from ignite.engine import Engine
+from ignite.metrics import MeanAbsoluteError, RootMeanSquaredError
+from torch import Tensor
 
+from evaluation.metrics import OptimizerLastState, PearsonCorrelation
 from model import Regressor
-from evaluation.metrics import PearsonCorrelation, OptimizerLastState
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 @dataclass
@@ -30,20 +32,17 @@ class RegressionTrainer(Engine):
 
         if compile_model is not None:
             try:
-                self.net = torch.compile(
-                    self.net, **compile_model)
+                self.net = torch.compile(self.net, **compile_model)
             except RuntimeError as e:
                 print(f"torch.compile failed: {e}")
 
-    def update(self,
-               engine: Engine,
-               batch: tuple[Tensor, Tensor]) -> dict[str, Tensor]:
+    def update(self, engine: Engine, batch: tuple[Tensor, Tensor]) -> dict[str, Tensor]:
         self.net.train()
         self.opt.zero_grad()
 
         x, y = batch
-        x = x.cuda()
-        y = y.float().flatten().cuda()
+        x = x.to(DEVICE)
+        y = y.float().flatten().to(DEVICE)
 
         y_pred = self.net(x)
 
@@ -52,7 +51,4 @@ class RegressionTrainer(Engine):
         loss.backward()
         self.opt.step()
 
-        return {
-            "y_pred": y_pred,
-            "y": y
-        }
+        return {"y_pred": y_pred, "y": y}

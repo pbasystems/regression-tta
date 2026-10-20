@@ -1,0 +1,50 @@
+dataset:
+  name: cmapss
+  config:
+    source_domain: false
+    standardize: true
+    source_fd: FD001
+    target_fd: FD003
+    source_split: train
+    target_split: train
+    max_rul: 125.0
+    normalize_rul: false
+    window_size: 1
+
+regressor:
+  source: result/source/cmapss/source_model_14550.pt
+  type: table
+  config:
+    in_dims: 14
+    h_dims: 100
+    n_rep: 4
+
+optimizer:
+  param: fe
+  name: Adam
+  config:
+    lr: 1.0e-4
+    weight_decay: 0.0
+
+tta:
+  type: pca
+  config:
+    train_mode: false
+    weight_bias: 1.0
+    weight_exp: 1.0
+    pc_config:
+      stat_file: result/source/cmapss/feature_stats.pt
+      contrib_top_k: 5
+    loss_config:
+      eps: 1.0e-8
+    compile_model: &compile_model null
+
+evaluator:
+  compile_model: *compile_model
+
+adapt_dataloader:
+  batch_size: 64
+  shuffle: true
+
+val_dataloader:
+  batch_size: 256

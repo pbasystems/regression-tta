@@ -1,21 +1,23 @@
-from typing import Any
-from pprint import pprint
+import itertools
 import json
 from pathlib import Path
-import itertools
-
-import yaml
+from pprint import pprint
+from typing import Any
 
 import torch
-from torch.utils.data import DataLoader
+import yaml
 from ignite.engine import Events
 from ignite.handlers import ModelCheckpoint
+from torch.utils.data import DataLoader
 
-from utils.seed import fix_seed
-from model import create_regressor, Regressor, extract_bn_layers
 from dataset import get_datasets
 from evaluation.evaluator import RegressionEvaluator
+from feature_stats import resolve_checkpoint_path
+from model import Regressor, create_regressor, extract_bn_layers
 from tta import TTAEngine
+from utils.seed import fix_seed
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 def parse_args():
@@ -46,9 +48,10 @@ def main(args):
     with Path(args.o, "config.yaml").open("w", encoding="utf-8") as f:
         yaml.dump(config, f)
 
-    regressor = create_regressor(config).cuda()
-    regressor.load_state_dict(torch.load(p := config["regressor"]["source"]))
-    print(f"load {p}")
+    regressor = create_regressor(config).to(DEVICE)
+    ckpt_path = resolve_checkpoint_path(config["regressor"]["source"])
+    regressor.load_state_dict(torch.load(ckpt_path, map_location=DEVICE))
+    print(f"load {ckpt_path}")
 
     _, val_ds = get_datasets(config)
     val_dl = DataLoader(val_ds, **config["adapt_dataloader"])
@@ -57,10 +60,11 @@ def main(args):
     engine = TTAEngine(regressor, opt, **config["tta"]["config"])
 
     if args.save:
-        engine.add_event_handler(Events.COMPLETED,
-                                 ModelCheckpoint(
-                                     args.o, "adapted", require_empty=False),
-                                 {"regressor": regressor})
+        engine.add_event_handler(
+            Events.COMPLETED,
+            ModelCheckpoint(args.o, "adapted", require_empty=False),
+            {"regressor": regressor},
+        )
     reg_evaluator = RegressionEvaluator(regressor, **config["evaluator"])
 
     engine.run(val_dl)
@@ -69,7 +73,7 @@ def main(args):
     metrics = {
         "iteration": engine.state.iteration,
         "online": engine.state.metrics,
-        "offline": reg_evaluator.state.metrics
+        "offline": reg_evaluator.state.metrics,
     }
     pprint(metrics)
     with Path(args.o, "metrics.json").open("w", encoding="utf-8") as f:
@@ -84,14 +88,13 @@ def create_optimizer(net: Regressor, config: dict[str, Any]) -> torch.optim.Opti
             params = net.get_feature_extractor().parameters()
         case "fe_bn":
             bn_layers = extract_bn_layers(net.get_feature_extractor())
-            params = itertools.chain.from_iterable(
-                l.parameters() for l in bn_layers
-            )
+            params = itertools.chain.from_iterable(l.parameters() for l in bn_layers)
         case _ as p:
             raise ValueError(f"Invalid param: {p!r}")
 
     opt = eval(f"torch.optim.{config['optimizer']['name']}")(
-        params, **config["optimizer"]["config"])
+        params, **config["optimizer"]["config"]
+    )
     return opt
 
 

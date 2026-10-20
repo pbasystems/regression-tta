@@ -8,8 +8,7 @@ authors = [
 ]
 requires-python = ">=3.13"
 dependencies = [
-    "imagenet-c>=0.0.3",
-    "numpy<2",
+    "numpy>=2.1",
     "pandas>=2.3.3",
     "pillow>=12.3.0",
     "pytorch-ignite>=0.5.5",

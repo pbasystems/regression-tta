@@ -2,10 +2,11 @@ from typing import Any
 
 from torch.utils.data import Dataset
 
-from .raw_datasets import get_mnist, get_svhn, get_transforms
-from .utkface import get_utkface
 from .biwi_kinect import get_biwi_kinect
 from .california_housing import get_calfornia_housing
+from .cmapss import get_cmapss
+from .raw_datasets import get_mnist, get_svhn, get_transforms
+from .utkface import get_utkface
 
 
 def get_datasets(config: dict[str, Any]) -> tuple[Dataset, Dataset]:
@@ -28,10 +29,12 @@ def get_datasets(config: dict[str, Any]) -> tuple[Dataset, Dataset]:
         case "biwi_kinect":
             aug_config = config["dataset"].get("aug_config", {})
             train_ds, val_ds = get_biwi_kinect(
-                config, classification=False, **aug_config)
+                config, classification=False, **aug_config
+            )
         case "calfornia_housing":
-            train_ds, val_ds = get_calfornia_housing(
-                config, classification=False)
+            train_ds, val_ds = get_calfornia_housing(config, classification=False)
+        case "cmapss":
+            train_ds, val_ds = get_cmapss(config)
         case _:
             raise ValueError(f"Invalid dataset: {name!r}")
 

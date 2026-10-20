@@ -1,0 +1,27 @@
+dataset:
+  name: cmapss
+  config:
+    source_domain: true
+    standardize: true
+    source_fd: FD001
+    target_fd: FD003
+    source_split: train
+    target_split: train
+    max_rul: 125.0
+    normalize_rul: false
+    window_size: 1
+  train_ratio: 0.9
+
+regressor:
+  source: result/source/cmapss/source_model_14550.pt
+  type: table
+  config:
+    in_dims: 14
+    h_dims: 100
+    n_rep: 4
+
+calculator:
+  compile_model: null
+
+dataloader:
+  batch_size: 256

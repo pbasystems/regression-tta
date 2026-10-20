@@ -1,0 +1,35 @@
+dataset:
+  config:
+    max_rul: 125.0
+    normalize_rul: false
+    source_domain: true
+    source_fd: FD001
+    source_split: train
+    standardize: true
+    target_fd: FD003
+    target_split: train
+    window_size: 1
+  name: cmapss
+  train_ratio: 0.9
+epoch: 50
+evaluator:
+  compile_model: null
+optimizer:
+  config:
+    lr: 0.001
+    weight_decay: 0.0005
+  name: Adam
+  param: all
+regressor:
+  config:
+    h_dims: 100
+    in_dims: 14
+    n_rep: 4
+  type: table
+train_dataloader:
+  batch_size: 64
+  shuffle: true
+trainer:
+  compile_model: null
+val_dataloader:
+  batch_size: 256
