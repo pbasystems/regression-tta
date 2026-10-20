@@ -4,7 +4,7 @@ import torch
 from ignite.contrib.metrics.regression.r2_score import R2Score
 from ignite.engine import Engine
 from ignite.metrics import MeanAbsoluteError, RootMeanSquaredError
-from torch import Tensor
+from torch import Tensor, nn
 
 from evaluation.metrics import ModelDistanceMetric, PearsonCorrelation
 from model import Regressor
@@ -88,22 +88,42 @@ class TTAEngine(Engine):
         x, y = batch
         x = x.to(DEVICE)
 
-        feature = self.feature_extractor(x)
-        y_pred = self.net.predict_from_feature(feature)
+        # cuDNN RNNs (LSTM/GRU) require cudnn.enabled=False when running backward() in eval() mode
+        has_rnn = any(isinstance(m, nn.RNNBase) for m in self.net.modules())
+        if has_rnn and not self.train_mode and x.is_cuda:
+            with torch.backends.cudnn.flags(enabled=False):
+                feature = self.feature_extractor(x)
+                y_pred = self.net.predict_from_feature(feature)
 
-        # (B,D) @ (D,d) -> (B,d)
-        f_pc = (feature - self.mean) @ self.basis
-        f_pc_mean = f_pc.mean(dim=0)  # (d)
-        f_pc_var = f_pc.var(dim=0)  # (d)
+                # (B,D) @ (D,d) -> (B,d)
+                f_pc = (feature - self.mean) @ self.basis
+                f_pc_mean = f_pc.mean(dim=0)  # (d)
+                f_pc_var = f_pc.var(dim=0)  # (d)
 
-        zeros = torch.zeros_like(f_pc_mean)
-        kl_loss = self.loss_fn(f_pc_mean, f_pc_var, zeros, self.var) + self.loss_fn(
-            zeros, self.var, f_pc_mean, f_pc_var
-        )
+                zeros = torch.zeros_like(f_pc_mean)
+                kl_loss = self.loss_fn(
+                    f_pc_mean, f_pc_var, zeros, self.var
+                ) + self.loss_fn(zeros, self.var, f_pc_mean, f_pc_var)
 
-        kl_loss = kl_loss @ self.dim_weight
+                kl_loss = kl_loss @ self.dim_weight
+                kl_loss.backward()
+        else:
+            feature = self.feature_extractor(x)
+            y_pred = self.net.predict_from_feature(feature)
 
-        kl_loss.backward()
+            # (B,D) @ (D,d) -> (B,d)
+            f_pc = (feature - self.mean) @ self.basis
+            f_pc_mean = f_pc.mean(dim=0)  # (d)
+            f_pc_var = f_pc.var(dim=0)  # (d)
+
+            zeros = torch.zeros_like(f_pc_mean)
+            kl_loss = self.loss_fn(f_pc_mean, f_pc_var, zeros, self.var) + self.loss_fn(
+                zeros, self.var, f_pc_mean, f_pc_var
+            )
+
+            kl_loss = kl_loss @ self.dim_weight
+            kl_loss.backward()
+
         self.opt.step()
 
         return {
