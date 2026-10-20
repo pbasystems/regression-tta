@@ -39,12 +39,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "-c",
         default="configs/tta/cmapss.yaml",
-        help="Base TTA YAML config file",
+        help="Base TTA YAML config file (use configs/tta/cmapss_mlp.yaml for old MLP model)",
     )
     parser.add_argument(
         "--train-config",
         default="configs/train_source/cmapss.yaml",
-        help="Base source-training YAML config file",
+        help="Base source-training YAML config file (use configs/train_source/cmapss_mlp.yaml for old MLP model)",
     )
     parser.add_argument(
         "-o",
@@ -147,34 +147,64 @@ def run_source_val_trial(
     patience: int = 20,
     reporter: Reporter | None = None,
 ) -> tuple[float, dict[str, Any], dict[str, Any], torch.nn.Module]:
-    """Tunes source model using ONLY Source Validation RMSE with EarlyStopping (zero target domain leakage)."""
+    """Tunes source model using ONLY Source Validation RMSE with EarlyStopping (supports both 'table' MLP and 'lstm_dann')."""
     fix_seed(seed)
     train_cfg = copy.deepcopy(base_train_cfg)
     tta_cfg = copy.deepcopy(base_tta_cfg)
 
-    lstm_hidden_size = trial.suggest_categorical("lstm_hidden_size", [64, 128, 256])
-    f_size = trial.suggest_categorical("f_size", [32, 64, 128])
-    num_layers = trial.suggest_int("num_layers", 1, 2)
-    reg_first = trial.suggest_categorical("regressor_first_hidden_size", [16, 32, 64])
-    reg_second = trial.suggest_categorical("regressor_second_hidden_size", [0, 16, 32])
-    lstm_dropout = trial.suggest_float("lstm_dropout", 0.1, 0.5)
-    reg_dropout = trial.suggest_float("regressor_dropout", 0.0, 0.4)
+    model_type = train_cfg["regressor"]["type"]
     source_lr = trial.suggest_float("source_lr", 3e-4, 5e-3, log=True)
     source_wd = trial.suggest_float("source_weight_decay", 1e-6, 1e-3, log=True)
     source_batch_size = trial.suggest_categorical("source_batch_size", [64, 128, 256])
 
-    for cfg in (train_cfg, tta_cfg):
-        cfg["regressor"]["config"].update(
-            {
-                "lstm_hidden_size": lstm_hidden_size,
-                "f_size": f_size,
-                "num_layers": num_layers,
-                "regressor_first_hidden_size": reg_first,
-                "regressor_second_hidden_size": reg_second,
-                "lstm_dropout": lstm_dropout,
-                "regressor_dropout": reg_dropout,
-            }
+    if model_type == "table":
+        # Old model (MLPRegressor) architecture & preprocessing hyperparameters
+        h_dims = trial.suggest_categorical("h_dims", [64, 100, 128, 256])
+        n_rep = trial.suggest_int("n_rep", 1, 6)
+        feature_cols = trial.suggest_categorical(
+            "feature_cols", ["sensors_14", "all_24"]
         )
+        window_size = trial.suggest_categorical("window_size", [1, 5, 15, 30])
+        norm_mode = trial.suggest_categorical("norm_mode", ["minmax", "standardize"])
+        n_feats = 14 if feature_cols == "sensors_14" else 24
+        in_dims = n_feats * window_size
+
+        for cfg in (train_cfg, tta_cfg):
+            cfg["regressor"]["type"] = "table"
+            cfg["regressor"]["config"] = {
+                "in_dims": in_dims,
+                "h_dims": h_dims,
+                "n_rep": n_rep,
+            }
+            cfg["dataset"]["config"]["feature_cols"] = feature_cols
+            cfg["dataset"]["config"]["window_size"] = window_size
+            cfg["dataset"]["config"]["norm_mode"] = norm_mode
+    else:
+        # New model (LSTMDANNRegressor) architecture hyperparameters
+        lstm_hidden_size = trial.suggest_categorical("lstm_hidden_size", [64, 128, 256])
+        f_size = trial.suggest_categorical("f_size", [32, 64, 128])
+        num_layers = trial.suggest_int("num_layers", 1, 2)
+        reg_first = trial.suggest_categorical(
+            "regressor_first_hidden_size", [16, 32, 64]
+        )
+        reg_second = trial.suggest_categorical(
+            "regressor_second_hidden_size", [0, 16, 32]
+        )
+        lstm_dropout = trial.suggest_float("lstm_dropout", 0.1, 0.5)
+        reg_dropout = trial.suggest_float("regressor_dropout", 0.0, 0.4)
+
+        for cfg in (train_cfg, tta_cfg):
+            cfg["regressor"]["config"].update(
+                {
+                    "lstm_hidden_size": lstm_hidden_size,
+                    "f_size": f_size,
+                    "num_layers": num_layers,
+                    "regressor_first_hidden_size": reg_first,
+                    "regressor_second_hidden_size": reg_second,
+                    "lstm_dropout": lstm_dropout,
+                    "regressor_dropout": reg_dropout,
+                }
+            )
 
     train_cfg["optimizer"]["config"]["lr"] = source_lr
     train_cfg["optimizer"]["config"]["weight_decay"] = source_wd
@@ -268,13 +298,18 @@ def run_tta_trial(
     fix_seed(seed)
     cfg = copy.deepcopy(base_config)
 
+    model_type = cfg["regressor"]["type"]
+    adapt_param_choices = (
+        ["fe", "fe_bn", "all"] if model_type == "table" else ["fe", "all"]
+    )
+
     contrib_top_k = trial.suggest_int("contrib_top_k", 2, min(32, max_pc_dim))
     lr = trial.suggest_float("lr", 1e-5, 5e-3, log=True)
     weight_decay = trial.suggest_float("weight_decay", 1e-7, 1e-2, log=True)
     optimizer_name = trial.suggest_categorical(
         "optimizer_name", ["Adam", "AdamW", "SGD"]
     )
-    adapt_param = trial.suggest_categorical("adapt_param", ["fe", "all"])
+    adapt_param = trial.suggest_categorical("adapt_param", adapt_param_choices)
     weight_bias = trial.suggest_float("weight_bias", 0.0, 5.0)
     weight_exp = trial.suggest_float("weight_exp", 0.0, 3.0)
     loss_eps = trial.suggest_float("loss_eps", 1e-8, 1e-1, log=True)
@@ -374,7 +409,10 @@ def main() -> None:
         base_train_config = yaml.safe_load(f)
 
     domain_tag = get_domain_tag(base_tta_config)
-    out_dir = Path(args.o or f"result/optuna/{domain_tag}_{args.objective}")
+    model_type = base_tta_config["regressor"]["type"]
+    out_dir = Path(
+        args.o or f"result/optuna/{domain_tag}_{model_type}_{args.objective}"
+    )
     out_dir.mkdir(parents=True, exist_ok=True)
 
     if args.storage.startswith("sqlite:///"):
@@ -383,7 +421,9 @@ def main() -> None:
     else:
         db_file = None
 
-    study_name = args.study_name or f"regression_tta_{domain_tag}_{args.objective}"
+    study_name = (
+        args.study_name or f"regression_tta_{domain_tag}_{model_type}_{args.objective}"
+    )
     use_wandb = (
         False
         if args.no_wandb
@@ -392,10 +432,11 @@ def main() -> None:
     project = base_tta_config.get("wandb", {}).get("project", "Regression-TTA")
 
     reporter = Reporter(
-        name=f"RegressionTTA.Optuna.{domain_tag}.{args.objective}",
+        name=f"RegressionTTA.Optuna.{domain_tag}.{model_type}.{args.objective}",
         use_wandb=use_wandb,
         wandb_project=project,
         wandb_config={
+            "model_type": model_type,
             "objective": args.objective,
             "n_trials": args.n_trials,
             "patience": args.patience,
@@ -403,7 +444,7 @@ def main() -> None:
             "study_name": study_name,
             "base_tta_config": base_tta_config,
         },
-        wandb_run_name=f"{domain_tag} | Optuna [{args.objective}] ({args.n_trials} trials)",
+        wandb_run_name=f"{domain_tag} | {model_type} | Optuna [{args.objective}] ({args.n_trials} trials)",
     )
 
     best_state: dict[str, Any] = {
@@ -515,6 +556,7 @@ def main() -> None:
 
     summary = {
         "domain": domain_tag,
+        "model_type": model_type,
         "study_name": study_name,
         "storage": args.storage,
         "objective": args.objective,
@@ -539,7 +581,7 @@ def main() -> None:
     extra_files = [db_file] if (db_file is not None and db_file.is_file()) else []
     reporter.log_directory_artifacts(
         directory=out_dir,
-        artifact_name=f"optuna-{args.objective}-{domain_tag}",
+        artifact_name=f"optuna-{model_type}-{args.objective}-{domain_tag}",
         artifact_type="optuna_study",
         patterns=("*.pt", "*.pth", "*.json", "*.csv", "*.yaml", "*.db"),
         extra_files=extra_files,

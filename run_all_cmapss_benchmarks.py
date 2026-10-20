@@ -76,6 +76,12 @@ DEFAULT_ARCH_BY_SOURCE: dict[str, dict[str, Any]] = {
     },
 }
 
+DEFAULT_MLP_ARCH: dict[str, Any] = {
+    "in_dims": 14,
+    "h_dims": 100,
+    "n_rep": 4,
+}
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -83,6 +89,12 @@ def parse_args() -> argparse.Namespace:
             "Run full CMAPSS cross-domain benchmark (all 12 FD00X->FD00Y tasks) "
             "across Source-Only, Target-Only, and Optuna-tuned objectives, and export CSV tables."
         )
+    )
+    parser.add_argument(
+        "--model-type",
+        choices=["lstm_dann", "table"],
+        default="lstm_dann",
+        help="Model architecture to benchmark: 'lstm_dann' (LSTM-DANN) or 'table' (original regression-tta MLPRegressor)",
     )
     parser.add_argument(
         "-o",
@@ -154,8 +166,11 @@ def build_base_train_config(
     fd: str,
     epochs: int,
     patience: int = 20,
+    model_type: str = "lstm_dann",
     arch_cfg: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    is_mlp = model_type == "table"
+    default_arch = DEFAULT_MLP_ARCH if is_mlp else DEFAULT_ARCH_BY_SOURCE[fd]
     return {
         "epoch": epochs,
         "early_stopping": {
@@ -173,29 +188,29 @@ def build_base_train_config(
                 "target_fd": fd,
                 "source_split": "train",
                 "target_split": "train",
-                "feature_cols": "all_24",
+                "feature_cols": "sensors_14" if is_mlp else "all_24",
                 "max_rul": 125.0,
                 "normalize_rul": False,
-                "window_size": 30,
+                "window_size": 1 if is_mlp else 30,
             },
             "train_ratio": 0.9,
             "split_by_engine": True,
         },
         "regressor": {
-            "type": "lstm_dann",
-            "config": copy.deepcopy(arch_cfg or DEFAULT_ARCH_BY_SOURCE[fd]),
+            "type": model_type,
+            "config": copy.deepcopy(arch_cfg or default_arch),
         },
         "optimizer": {
             "param": "all",
             "name": "Adam",
             "config": {
                 "lr": 1.0e-3,
-                "weight_decay": 1.0e-4,
+                "weight_decay": 5.0e-4 if is_mlp else 1.0e-4,
             },
         },
         "trainer": {"compile_model": None},
         "evaluator": {"compile_model": None},
-        "train_dataloader": {"batch_size": 256, "shuffle": True},
+        "train_dataloader": {"batch_size": 64 if is_mlp else 256, "shuffle": True},
         "val_dataloader": {"batch_size": 256},
     }
 
@@ -206,30 +221,39 @@ def build_base_tta_config(
     ckpt_path: Path,
     stat_path: Path,
     arch_cfg: dict[str, Any],
+    model_type: str = "lstm_dann",
+    dataset_overrides: dict[str, Any] | None = None,
     target_split: str = "test",
     last_window_only: bool = False,
 ) -> dict[str, Any]:
+    is_mlp = model_type == "table"
+    ds_cfg: dict[str, Any] = {
+        "source_domain": False,
+        "norm_mode": "minmax",
+        "combine_splits_for_stats": True,
+        "source_fd": source_fd,
+        "target_fd": target_fd,
+        "source_split": "train",
+        "target_split": target_split,
+        "feature_cols": "sensors_14" if is_mlp else "all_24",
+        "max_rul": 125.0,
+        "normalize_rul": False,
+        "window_size": 1 if is_mlp else 30,
+        "last_window_only": last_window_only,
+    }
+    if dataset_overrides:
+        for k in ("norm_mode", "feature_cols", "window_size"):
+            if k in dataset_overrides:
+                ds_cfg[k] = dataset_overrides[k]
+
     return {
         "dataset": {
             "name": "cmapss",
-            "config": {
-                "source_domain": False,
-                "norm_mode": "minmax",
-                "combine_splits_for_stats": True,
-                "source_fd": source_fd,
-                "target_fd": target_fd,
-                "source_split": "train",
-                "target_split": target_split,
-                "feature_cols": "all_24",
-                "max_rul": 125.0,
-                "normalize_rul": False,
-                "window_size": 30,
-                "last_window_only": last_window_only,
-            },
+            "config": ds_cfg,
         },
         "regressor": {
             "source": str(ckpt_path),
-            "type": "lstm_dann",
+            "type": model_type,
             "config": copy.deepcopy(arch_cfg),
         },
         "optimizer": {
@@ -255,7 +279,7 @@ def build_base_tta_config(
             },
         },
         "evaluator": {"compile_model": None},
-        "adapt_dataloader": {"batch_size": 256, "shuffle": True},
+        "adapt_dataloader": {"batch_size": 64 if is_mlp else 256, "shuffle": True},
         "val_dataloader": {"batch_size": 256},
     }
 
@@ -295,34 +319,37 @@ def train_or_load_domain_model(
     out_root: Path,
     epochs: int,
     patience: int,
+    model_type: str,
     seed: int,
     use_wandb: bool,
     wandb_project: str,
 ) -> tuple[Path, Path, dict[str, Any], dict[str, Any]]:
     """Trains (or loads if cached) the base model with EarlyStopping and feature_stats.pt for a single FD domain."""
-    domain_dir = out_root / "domain_models" / fd
+    domain_dir = out_root / "domain_models" / f"{fd}_{model_type}"
     domain_dir.mkdir(parents=True, exist_ok=True)
     ckpt_path = domain_dir / f"source_model_{fd}.pt"
     stat_path = domain_dir / "feature_stats.pt"
     meta_path = domain_dir / "train_summary.json"
-    train_cfg = build_base_train_config(fd, epochs=epochs, patience=patience)
+    train_cfg = build_base_train_config(
+        fd, epochs=epochs, patience=patience, model_type=model_type
+    )
 
     if ckpt_path.is_file() and stat_path.is_file() and meta_path.is_file():
-        print(f"[{fd}] Loading existing base model from {ckpt_path}")
+        print(f"[{fd} | {model_type}] Loading existing base model from {ckpt_path}")
         with meta_path.open("r", encoding="utf-8") as f:
             meta = json.load(f)
         return ckpt_path, stat_path, train_cfg, meta
 
     print(
-        f"\n================ TRAINING BASE MODEL ON {fd} (max {epochs} epochs, patience={patience}) ================"
+        f"\n================ TRAINING BASE MODEL ({model_type}) ON {fd} (max {epochs} epochs, patience={patience}) ================"
     )
     fix_seed(seed)
     reporter = Reporter(
-        name=f"Benchmark.Train.{fd}",
+        name=f"Benchmark.Train.{fd}.{model_type}",
         use_wandb=use_wandb,
         wandb_project=wandb_project,
         wandb_config=train_cfg,
-        wandb_run_name=f"{fd} | Base Domain Model Train",
+        wandb_run_name=f"{fd} | {model_type} | Base Domain Model Train",
     )
 
     net = create_regressor(train_cfg).to(DEVICE)
@@ -361,7 +388,6 @@ def train_or_load_domain_model(
     )
     trainer.run(train_dl, max_epochs=epochs)
 
-    # Re-evaluate restored best weights on validation split
     val_ev.run(val_dl)
 
     torch.save(net.state_dict(), ckpt_path)
@@ -369,6 +395,7 @@ def train_or_load_domain_model(
 
     meta = {
         "fd": fd,
+        "model_type": model_type,
         "max_epochs": epochs,
         "best_epoch": stopper.best_epoch,
         "patience": patience,
@@ -390,7 +417,7 @@ def train_or_load_domain_model(
     )
     reporter.log_directory_artifacts(
         directory=domain_dir,
-        artifact_name=f"base-domain-model-{fd}",
+        artifact_name=f"base-domain-model-{model_type}-{fd}",
         artifact_type="model",
     )
     reporter.finish()
@@ -405,26 +432,28 @@ def tune_source_domain_optuna(
     n_trials: int,
     epochs: int,
     patience: int,
+    model_type: str,
     seed: int,
     use_wandb: bool,
     wandb_project: str,
 ) -> tuple[Path, Path, dict[str, Any], dict[str, Any]]:
     """Tunes source model architecture & optimizer on FD validation split with EarlyStopping."""
-    tuned_dir = out_root / "source_tuned_models" / fd
+    tuned_dir = out_root / "source_tuned_models" / f"{fd}_{model_type}"
     tuned_dir.mkdir(parents=True, exist_ok=True)
     ckpt_path = tuned_dir / f"best_source_model_{fd}.pt"
     stat_path = tuned_dir / "feature_stats.pt"
     cfg_path = tuned_dir / "best_train_config.yaml"
     summary_path = tuned_dir / "source_optuna_summary.json"
 
-    if ckpt_path.is_file() and stat_path.is_file() and cfg_path.is_file() and summary_path.is_file():
     if (
         ckpt_path.is_file()
         and stat_path.is_file()
         and cfg_path.is_file()
         and summary_path.is_file()
     ):
-        print(f"[{fd}] Loading existing source-tuned model from {ckpt_path}")
+        print(
+            f"[{fd} | {model_type}] Loading existing source-tuned model from {ckpt_path}"
+        )
         with cfg_path.open("r", encoding="utf-8") as f:
             best_train_cfg = yaml.safe_load(f)
         with summary_path.open("r", encoding="utf-8") as f:
@@ -432,22 +461,25 @@ def tune_source_domain_optuna(
         return ckpt_path, stat_path, best_train_cfg, summary
 
     print(
-        f"\n================ OPTUNA SOURCE TUNING ON {fd} ({n_trials} trials, patience={patience}) ================"
+        f"\n================ OPTUNA SOURCE TUNING ({model_type}) ON {fd} ({n_trials} trials, patience={patience}) ================"
     )
-    study_name = f"benchmark_source_val_rmse_{fd}"
-    base_train_cfg = build_base_train_config(fd, epochs=epochs, patience=patience)
+    study_name = f"benchmark_source_val_rmse_{model_type}_{fd}"
+    base_train_cfg = build_base_train_config(
+        fd, epochs=epochs, patience=patience, model_type=model_type
+    )
 
     reporter = Reporter(
-        name=f"Benchmark.SourceOptuna.{fd}",
+        name=f"Benchmark.SourceOptuna.{fd}.{model_type}",
         use_wandb=use_wandb,
         wandb_project=wandb_project,
         wandb_config={
             "fd": fd,
+            "model_type": model_type,
             "n_trials": n_trials,
             "epochs": epochs,
             "patience": patience,
         },
-        wandb_run_name=f"{fd} | Optuna [source_val_rmse] ({n_trials} trials)",
+        wandb_run_name=f"{fd} | {model_type} | Optuna [source_val_rmse] ({n_trials} trials)",
     )
 
     best_holder: dict[str, Any] = {
@@ -462,34 +494,60 @@ def tune_source_domain_optuna(
         fix_seed(seed)
         cfg = copy.deepcopy(base_train_cfg)
 
-        lstm_hidden_size = trial.suggest_categorical("lstm_hidden_size", [64, 128, 256])
-        f_size = trial.suggest_categorical("f_size", [32, 64, 128])
-        num_layers = trial.suggest_int("num_layers", 1, 2)
-        reg_first = trial.suggest_categorical(
-            "regressor_first_hidden_size", [16, 32, 64]
-        )
-        reg_second = trial.suggest_categorical(
-            "regressor_second_hidden_size", [0, 16, 32]
-        )
-        lstm_dropout = trial.suggest_float("lstm_dropout", 0.1, 0.5)
-        reg_dropout = trial.suggest_float("regressor_dropout", 0.0, 0.4)
         source_lr = trial.suggest_float("source_lr", 3e-4, 5e-3, log=True)
         source_wd = trial.suggest_float("source_weight_decay", 1e-6, 1e-3, log=True)
         source_batch_size = trial.suggest_categorical(
             "source_batch_size", [64, 128, 256]
         )
 
-        cfg["regressor"]["config"].update(
-            {
-                "lstm_hidden_size": lstm_hidden_size,
-                "f_size": f_size,
-                "num_layers": num_layers,
-                "regressor_first_hidden_size": reg_first,
-                "regressor_second_hidden_size": reg_second,
-                "lstm_dropout": lstm_dropout,
-                "regressor_dropout": reg_dropout,
+        if model_type == "table":
+            h_dims = trial.suggest_categorical("h_dims", [64, 100, 128, 256])
+            n_rep = trial.suggest_int("n_rep", 1, 6)
+            feature_cols = trial.suggest_categorical(
+                "feature_cols", ["sensors_14", "all_24"]
+            )
+            window_size = trial.suggest_categorical("window_size", [1, 5, 15, 30])
+            norm_mode = trial.suggest_categorical(
+                "norm_mode", ["minmax", "standardize"]
+            )
+            n_feats = 14 if feature_cols == "sensors_14" else 24
+            in_dims = n_feats * window_size
+
+            cfg["regressor"]["config"] = {
+                "in_dims": in_dims,
+                "h_dims": h_dims,
+                "n_rep": n_rep,
             }
-        )
+            cfg["dataset"]["config"]["feature_cols"] = feature_cols
+            cfg["dataset"]["config"]["window_size"] = window_size
+            cfg["dataset"]["config"]["norm_mode"] = norm_mode
+        else:
+            lstm_hidden_size = trial.suggest_categorical(
+                "lstm_hidden_size", [64, 128, 256]
+            )
+            f_size = trial.suggest_categorical("f_size", [32, 64, 128])
+            num_layers = trial.suggest_int("num_layers", 1, 2)
+            reg_first = trial.suggest_categorical(
+                "regressor_first_hidden_size", [16, 32, 64]
+            )
+            reg_second = trial.suggest_categorical(
+                "regressor_second_hidden_size", [0, 16, 32]
+            )
+            lstm_dropout = trial.suggest_float("lstm_dropout", 0.1, 0.5)
+            reg_dropout = trial.suggest_float("regressor_dropout", 0.0, 0.4)
+
+            cfg["regressor"]["config"].update(
+                {
+                    "lstm_hidden_size": lstm_hidden_size,
+                    "f_size": f_size,
+                    "num_layers": num_layers,
+                    "regressor_first_hidden_size": reg_first,
+                    "regressor_second_hidden_size": reg_second,
+                    "lstm_dropout": lstm_dropout,
+                    "regressor_dropout": reg_dropout,
+                }
+            )
+
         cfg["optimizer"]["config"]["lr"] = source_lr
         cfg["optimizer"]["config"]["weight_decay"] = source_wd
         cfg["train_dataloader"]["batch_size"] = source_batch_size
@@ -574,6 +632,7 @@ def tune_source_domain_optuna(
     study.trials_dataframe().to_csv(tuned_dir / "optuna_trials.csv", index=False)
     summary = {
         "fd": fd,
+        "model_type": model_type,
         "study_name": study_name,
         "best_trial": study.best_trial.number,
         "best_epoch": best_holder["best_epoch"],
@@ -587,7 +646,7 @@ def tune_source_domain_optuna(
 
     reporter.log_directory_artifacts(
         directory=tuned_dir,
-        artifact_name=f"source-tuned-{fd}",
+        artifact_name=f"source-tuned-{model_type}-{fd}",
         artifact_type="model",
     )
     reporter.finish()
@@ -644,12 +703,13 @@ def tune_tta_for_task_objective(
     out_root: Path,
     storage: str,
     n_trials: int,
+    model_type: str,
     seed: int,
     use_wandb: bool,
     wandb_project: str,
 ) -> dict[str, Any]:
     """Runs Optuna TTA hyperparameter tuning for a single (source_fd -> target_fd, objective_name) pair."""
-    task_tag = f"{source_fd}_to_{target_fd}"
+    task_tag = f"{source_fd}_to_{target_fd}_{model_type}"
     study_dir = out_root / "tasks" / task_tag / objective_name
     study_dir.mkdir(parents=True, exist_ok=True)
     summary_path = study_dir / "study_summary.json"
@@ -664,9 +724,9 @@ def tune_tta_for_task_objective(
             return json.load(f)
 
     print(
-        f"\n--- Tuning Task {source_fd} -> {target_fd} | Objective: {objective_name} ({n_trials} trials) ---"
+        f"\n--- Tuning Task {source_fd} -> {target_fd} ({model_type}) | Objective: {objective_name} ({n_trials} trials) ---"
     )
-    study_name = f"benchmark_{source_fd}_to_{target_fd}_{objective_name}"
+    study_name = f"benchmark_{model_type}_{source_fd}_to_{target_fd}_{objective_name}"
     stat_file = base_tta_cfg["tta"]["config"]["pc_config"]["stat_file"]
     stat_dict = torch.load(stat_file, map_location="cpu")
     max_pc_dim = int(stat_dict["eigvals"].shape[0])
@@ -679,11 +739,12 @@ def tune_tta_for_task_objective(
         wandb_project=wandb_project,
         wandb_config={
             "task": f"{source_fd}->{target_fd}",
+            "model_type": model_type,
             "objective": objective_name,
             "n_trials": n_trials,
             "base_tta_config": base_tta_cfg,
         },
-        wandb_run_name=f"{source_fd}-to-{target_fd} | Optuna [{objective_name}] ({n_trials} trials)",
+        wandb_run_name=f"{source_fd}-to-{target_fd} | {model_type} | Optuna [{objective_name}] ({n_trials} trials)",
     )
 
     best_state: dict[str, Any] = {
@@ -736,6 +797,7 @@ def tune_tta_for_task_objective(
 
     summary = {
         "task": f"{source_fd}->{target_fd}",
+        "model_type": model_type,
         "source_fd": source_fd,
         "target_fd": target_fd,
         "objective": objective_name,
@@ -751,7 +813,7 @@ def tune_tta_for_task_objective(
 
     reporter.log_directory_artifacts(
         directory=study_dir,
-        artifact_name=f"optuna-{objective_name}-{source_fd}-to-{target_fd}",
+        artifact_name=f"optuna-{model_type}-{objective_name}-{source_fd}-to-{target_fd}",
         artifact_type="optuna_study",
     )
     reporter.finish()
@@ -821,6 +883,7 @@ def main() -> None:
 
     use_wandb = not args.no_wandb
     fds = args.fds
+    model_type = args.model_type
 
     # -------------------------------------------------------------------------
     # STEP 1: Train (or Load) Base Models & Feature Stats for Each FD (FD001..FD004)
@@ -830,7 +893,11 @@ def main() -> None:
     source_tuned_models: dict[
         str, tuple[Path, Path, dict[str, Any], dict[str, Any]]
     ] = {}
-    all_hyperparams: dict[str, Any] = {"source_val_rmse": {}, "tasks": {}}
+    all_hyperparams: dict[str, Any] = {
+        "model_type": model_type,
+        "source_val_rmse": {},
+        "tasks": {},
+    }
 
     for fd in fds:
         base_models[fd] = train_or_load_domain_model(
@@ -838,6 +905,7 @@ def main() -> None:
             out_root=out_root,
             epochs=args.epochs,
             patience=args.patience,
+            model_type=model_type,
             seed=args.seed,
             use_wandb=use_wandb,
             wandb_project=args.wandb_project,
@@ -850,6 +918,7 @@ def main() -> None:
                 n_trials=args.n_source_trials,
                 epochs=args.epochs,
                 patience=args.patience,
+                model_type=model_type,
                 seed=args.seed,
                 use_wandb=use_wandb,
                 wandb_project=args.wandb_project,
@@ -870,6 +939,8 @@ def main() -> None:
             ckpt_path=t_ckpt,
             stat_path=t_stat,
             arch_cfg=t_train_cfg["regressor"]["config"],
+            model_type=model_type,
+            dataset_overrides=t_train_cfg["dataset"]["config"],
             target_split=args.target_split,
             last_window_only=args.last_window_only,
         )
@@ -877,7 +948,7 @@ def main() -> None:
             t_eval_cfg, t_ckpt, seed=args.seed
         )
         print(
-            f"[Target-Only Baseline {target_fd}->{target_fd}] "
+            f"[Target-Only Baseline {target_fd}->{target_fd} ({model_type})] "
             f"RMSE={target_only_metrics[target_fd]['rmse_loss']:.2f}, "
             f"MAE={target_only_metrics[target_fd]['mae_loss']:.2f}"
         )
@@ -895,10 +966,10 @@ def main() -> None:
 
             task_name = f"{source_fd}->{target_fd}"
             print(
-                f"\n=================================================================="
+                "\n=================================================================="
             )
-            print(f"                  BENCHMARK TASK: {task_name}")
-            print(f"==================================================================")
+            print(f"          BENCHMARK TASK: {task_name} (model={model_type})")
+            print("==================================================================")
 
             src_ckpt, src_stat, src_train_cfg, _ = base_models[source_fd]
             base_tta_cfg = build_base_tta_config(
@@ -907,6 +978,8 @@ def main() -> None:
                 ckpt_path=src_ckpt,
                 stat_path=src_stat,
                 arch_cfg=src_train_cfg["regressor"]["config"],
+                model_type=model_type,
+                dataset_overrides=src_train_cfg["dataset"]["config"],
                 target_split=args.target_split,
                 last_window_only=args.last_window_only,
             )
@@ -921,6 +994,7 @@ def main() -> None:
 
             row: dict[str, Any] = {
                 "Task": task_name,
+                "Model_Type": model_type,
                 "Source_FD": source_fd,
                 "Target_FD": target_fd,
                 "Source_Only_RMSE": round(source_only["rmse_loss"], 4),
@@ -940,6 +1014,8 @@ def main() -> None:
                     ckpt_path=st_ckpt,
                     stat_path=st_stat,
                     arch_cfg=st_train_cfg["regressor"]["config"],
+                    model_type=model_type,
+                    dataset_overrides=st_train_cfg["dataset"]["config"],
                     target_split=args.target_split,
                     last_window_only=args.last_window_only,
                 )
@@ -978,6 +1054,7 @@ def main() -> None:
                     out_root=out_root,
                     storage=args.storage,
                     n_trials=args.n_tta_trials,
+                    model_type=model_type,
                     seed=args.seed,
                     use_wandb=use_wandb,
                     wandb_project=args.wandb_project,
@@ -1008,6 +1085,7 @@ def main() -> None:
                 row[f"{prefix}_Offline_MAE"] = round(
                     float(bm["offline"]["mae_loss"]), 4
                 )
+                row[f"{prefix}_Offline_R2"] = round(float(bm["offline"]["R2"]), 4)
                 row[f"{prefix}_Offline_r"] = round(float(bm["offline"]["r"]), 4)
 
             table_rows.append(row)
@@ -1031,16 +1109,16 @@ def main() -> None:
 
     if use_wandb:
         final_reporter = Reporter(
-            name="Benchmark.FinalSummary",
+            name=f"Benchmark.FinalSummary.{model_type}",
             use_wandb=True,
             wandb_project=args.wandb_project,
             wandb_config=vars(args),
-            wandb_run_name="CMAPSS All-12-Tasks Benchmark Summary",
+            wandb_run_name=f"CMAPSS All-12-Tasks Benchmark Summary ({model_type})",
         )
         extra_files = [db_file] if (db_file is not None and db_file.is_file()) else []
         final_reporter.log_directory_artifacts(
             directory=out_root,
-            artifact_name="cmapss-all-tasks-benchmark-summary",
+            artifact_name=f"cmapss-all-tasks-benchmark-{model_type}",
             artifact_type="benchmark_results",
             patterns=("*.csv", "*.json", "*.yaml"),
             extra_files=extra_files,
