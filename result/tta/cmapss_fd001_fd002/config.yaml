@@ -50,3 +50,7 @@ tta:
   type: pca
 val_dataloader:
   batch_size: 256
+wandb:
+  project: Regression-TTA
+  run_name: FD001-to-FD002 | TTA
+  use_wandb: true

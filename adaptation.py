@@ -6,6 +6,7 @@ from typing import Any
 
 import torch
 import yaml
+from dotenv import load_dotenv
 from ignite.engine import Events
 from ignite.handlers import ModelCheckpoint
 from torch.utils.data import DataLoader
@@ -15,7 +16,10 @@ from evaluation.evaluator import RegressionEvaluator
 from feature_stats import resolve_checkpoint_path
 from model import Regressor, create_regressor, extract_bn_layers
 from tta import TTAEngine
+from utils.reporter import create_reporter_from_config, get_domain_tag
 from utils.seed import fix_seed
+
+load_dotenv()
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -48,6 +52,12 @@ def main(args):
     with Path(args.o, "config.yaml").open("w", encoding="utf-8") as f:
         yaml.dump(config, f)
 
+    reporter = create_reporter_from_config(
+        config,
+        default_name=f"RegressionTTA.Adaptation.{args.seed}",
+        default_stage=f"TTA | Seed {args.seed}",
+    )
+
     regressor = create_regressor(config).to(DEVICE)
     ckpt_path = resolve_checkpoint_path(config["regressor"]["source"])
     regressor.load_state_dict(torch.load(ckpt_path, map_location=DEVICE))
@@ -56,28 +66,61 @@ def main(args):
     _, val_ds = get_datasets(config)
     val_dl = DataLoader(val_ds, **config["adapt_dataloader"])
 
+    reg_evaluator = RegressionEvaluator(regressor, **config["evaluator"])
+    reg_evaluator.run(val_dl)
+    unadapted_metrics = dict(reg_evaluator.state.metrics)
+
     opt = create_optimizer(regressor, config)
     engine = TTAEngine(regressor, opt, **config["tta"]["config"])
 
-    if args.save:
-        engine.add_event_handler(
-            Events.COMPLETED,
-            ModelCheckpoint(args.o, "adapted", require_empty=False),
-            {"regressor": regressor},
-        )
-    reg_evaluator = RegressionEvaluator(regressor, **config["evaluator"])
+    engine.add_event_handler(
+        Events.COMPLETED,
+        ModelCheckpoint(args.o, "adapted", require_empty=False),
+        {"regressor": regressor},
+    )
 
     engine.run(val_dl)
     reg_evaluator.run(val_dl)
 
     metrics = {
         "iteration": engine.state.iteration,
+        "unadapted": unadapted_metrics,
         "online": engine.state.metrics,
         "offline": reg_evaluator.state.metrics,
     }
     pprint(metrics)
+
     with Path(args.o, "metrics.json").open("w", encoding="utf-8") as f:
         json.dump(metrics, f, indent=4, ensure_ascii=False)
+
+    flat_wandb_metrics: dict[str, Any] = {"iteration": engine.state.iteration}
+    for stage_name in ("unadapted", "online", "offline"):
+        for k, v in metrics[stage_name].items():
+            flat_wandb_metrics[f"{stage_name}/{k}"] = (
+                float(v) if isinstance(v, (int, float)) else v
+            )
+    reporter.log_metrics(flat_wandb_metrics)
+
+    extra_pt_files: list[Path] = []
+    if ckpt_path.is_file():
+        extra_pt_files.append(ckpt_path)
+    stat_file = (
+        config.get("tta", {}).get("config", {}).get("pc_config", {}).get("stat_file")
+    )
+    if stat_file and Path(stat_file).is_file():
+        extra_pt_files.append(Path(stat_file))
+        raw_feat_candidate = Path(stat_file).parent / "raw_features.pt"
+        if raw_feat_candidate.is_file():
+            extra_pt_files.append(raw_feat_candidate)
+
+    domain_tag = get_domain_tag(config)
+    reporter.log_directory_artifacts(
+        directory=args.o,
+        artifact_name=f"tta-{domain_tag}",
+        artifact_type="model",
+        extra_files=extra_pt_files,
+    )
+    reporter.finish()
 
 
 def create_optimizer(net: Regressor, config: dict[str, Any]) -> torch.optim.Optimizer:

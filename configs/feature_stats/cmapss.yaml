@@ -1,3 +1,8 @@
+wandb:
+  use_wandb: true
+  project: Regression-TTA
+  run_name: FD001-to-FD002 | Feature-Stats
+
 dataset:
   name: cmapss
   config:

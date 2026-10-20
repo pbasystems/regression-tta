@@ -8,6 +8,7 @@ from torch import Tensor
 
 from evaluation.metrics import FeatureKLMetric, ModelDistanceMetric, PearsonCorrelation
 from model import Regressor
+from utils.logger import attach_progress_bar
 from utils.pca_basis import get_pca_basis
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -35,6 +36,13 @@ class RegressionEvaluator(Engine):
         PearsonCorrelation(y_ot).attach(self, "r")
 
         ModelDistanceMetric(self.net).attach(self, "model_dist")
+
+        attach_progress_bar(
+            self,
+            desc="evaluation",
+            show_epochs=False,
+            leave=False,
+        )
 
         if pc_config is not None:
             self.mean, self.pc_basis, self.pc_var = get_pca_basis(

@@ -9,6 +9,7 @@ from torch import Tensor
 
 from evaluation.metrics import OptimizerLastState, PearsonCorrelation
 from model import Regressor
+from utils.logger import attach_progress_bar
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -29,6 +30,14 @@ class RegressionTrainer(Engine):
         PearsonCorrelation(y_ot).attach(self, "r")
 
         OptimizerLastState(self.opt, "lr").attach(self, "lr")
+
+        attach_progress_bar(
+            self,
+            desc="regression",
+            show_epochs=True,
+            postfix_key="loss",
+            leave=False,
+        )
 
         if compile_model is not None:
             try:
@@ -51,4 +60,8 @@ class RegressionTrainer(Engine):
         loss.backward()
         self.opt.step()
 
-        return {"y_pred": y_pred, "y": y}
+        return {
+            "y_pred": y_pred,
+            "y": y,
+            "loss": loss.detach(),
+        }

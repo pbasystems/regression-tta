@@ -7,6 +7,7 @@ from typing import Any
 
 import torch
 import yaml
+from dotenv import load_dotenv
 from ignite.engine.events import Events
 from ignite.handlers.checkpoint import ModelCheckpoint
 from ignite.handlers.param_scheduler import (
@@ -21,7 +22,10 @@ from evaluation.evaluator import RegressionEvaluator
 from handlers import EvaluationAccumulator, EvaluationRunner
 from model import Regressor, create_regressor
 from trainer import RegressionTrainer
+from utils.reporter import create_reporter_from_config, get_domain_tag
 from utils.seed import fix_seed
+
+load_dotenv()
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -52,6 +56,12 @@ def main(args):
         yaml.dump(config, f)
 
     fix_seed(args.seed)
+
+    reporter = create_reporter_from_config(
+        config,
+        default_name=f"RegressionTTA.TrainSource.{args.seed}",
+        default_stage=f"Source-Train | Seed {args.seed}",
+    )
 
     net = create_regressor(config).to(DEVICE)
 
@@ -85,6 +95,18 @@ def main(args):
     trainer.add_event_handler(Events.EPOCH_COMPLETED, train_ev_runner)
 
     trainer.add_event_handler(Events.EPOCH_COMPLETED, val_ev_runner)
+
+    def _log_epoch_to_reporter(engine):
+        epoch = engine.state.epoch
+        log_dict: dict[str, Any] = {"epoch": epoch}
+        for k, v in trainer.state.metrics.items():
+            log_dict[f"train/{k}"] = float(v) if isinstance(v, (int, float)) else v
+        for k, v in evaluator.state.metrics.items():
+            log_dict[f"val/{k}"] = float(v) if isinstance(v, (int, float)) else v
+        reporter.log_metrics(log_dict, step=epoch)
+
+    trainer.add_event_handler(Events.EPOCH_COMPLETED, _log_epoch_to_reporter)
+
     trainer.add_event_handler(
         Events.COMPLETED,
         ModelCheckpoint(args.o, "source", require_empty=False),
@@ -106,6 +128,13 @@ def main(args):
     )
     trainer.run(train_dl, max_epochs=config["epoch"])
 
+    domain_tag = get_domain_tag(config)
+    reporter.log_directory_artifacts(
+        directory=args.o,
+        artifact_name=f"source-{domain_tag}",
+        artifact_type="model",
+    )
+    reporter.finish()
     print("done")
 
 

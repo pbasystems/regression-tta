@@ -8,6 +8,7 @@ from torch import Tensor
 
 from evaluation.metrics import ModelDistanceMetric, PearsonCorrelation
 from model import Regressor
+from utils.logger import attach_progress_bar
 from utils.loss import diagonal_gaussian_kl_loss
 from utils.pca_basis import get_pca_basis
 
@@ -43,6 +44,14 @@ class TTAEngine(Engine):
         PearsonCorrelation(y_ot).attach(self, "r")
 
         ModelDistanceMetric(self.net).attach(self, "model_dist")
+
+        attach_progress_bar(
+            self,
+            desc="TTA adaptation",
+            show_epochs=False,
+            postfix_key="kl_loss",
+            leave=False,
+        )
 
         mean, basis, var = get_pca_basis(**pc_config)
         self.mean = mean.to(DEVICE)
@@ -97,4 +106,9 @@ class TTAEngine(Engine):
         kl_loss.backward()
         self.opt.step()
 
-        return {"y_pred": y_pred, "y": y.to(DEVICE).float().flatten(), "feat_pc": f_pc}
+        return {
+            "y_pred": y_pred,
+            "y": y.to(DEVICE).float().flatten(),
+            "feat_pc": f_pc,
+            "kl_loss": kl_loss.detach(),
+        }
