@@ -247,9 +247,9 @@ def train_or_load_original_lstm_dann(
                 val_rmse_sum += torch.sqrt(mse_loss(y_vp, y_v)).item()
         val_rmse = val_rmse_sum / max(len(src_val_dl), 1)
 
-        if stopper.step(val_rmse, model):
+        if stopper.step(val_rmse, model, epoch=epoch + 1):
             print(
-                f"[LSTM-DANN] Early stopping at epoch {epoch + 1} (best epoch {stopper.best_epoch}, val_rmse={stopper.best_loss:.2f})"
+                f"[LSTM-DANN] Early stopping at epoch {epoch + 1} (best epoch {stopper.best_epoch}, val_rmse={stopper.best_score:.2f})"
             )
             break
         reg_sched.step()
@@ -336,6 +336,8 @@ def train_and_adapt_general_calibrated_tta(
 
     # Adapted General Calibrated Offline TTA model
     adapted_ckpt_path = (
+        out_dir / f"adapted_general_calibrated_{model_type}_{source_fd}_to_{target_fd}.pt"
+    )
         out_dir
         / f"adapted_general_calibrated_{model_type}_{source_fd}_to_{target_fd}.pt"
     )
@@ -645,8 +647,6 @@ def generate_feature_comparison_plots(
         .fit_transform((z_tta - z_tta.mean(0)) / (z_tta.std(0) + 1e-8))
         .flatten()
     )
-    # Align sign so both correlate in the same direction with RUL
-    if np.corrcoef(pc1_dann, y_true)[0, 1] < 0:
         pc1_dann = -pc1_dann
     if np.corrcoef(pc1_tta, y_true)[0, 1] < 0:
         pc1_tta = -pc1_tta
